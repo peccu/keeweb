@@ -1,9 +1,11 @@
 const electron = require('electron');
 const path = require('path');
 const fs = require('fs');
+const url = require('url');
 
 let perfTimestamps = global.perfTimestamps;
-perfTimestamps.push({ name: 'loading app requires', ts: process.hrtime() });
+
+perfTimestamps?.push({ name: 'loading app requires', ts: process.hrtime() });
 
 const app = electron.app;
 
@@ -14,35 +16,44 @@ let appReady = false;
 let restartPending = false;
 let mainWindowPosition = {};
 let updateMainWindowPositionTimeout = null;
+let mainWindowMaximized = false;
+
+const windowPositionFileName = 'window-position.json';
+const portableConfigFileName = 'keeweb-portable.json';
+
+const isDev = !__dirname.endsWith('.asar');
+
+const startupLogging =
+    process.argv.some((arg) => arg.startsWith('--startup-logging')) ||
+    process.env.KEEWEB_STARTUP_LOGGING === '1';
 
 const gotTheLock = app.requestSingleInstanceLock();
 if (!gotTheLock) {
     app.quit();
 }
 
-perfTimestamps && perfTimestamps.push({ name: 'single instance lock', ts: process.hrtime() });
+logProgress('single instance lock');
 
-let openFile = process.argv.filter(arg => /\.kdbx$/i.test(arg))[0];
-const userDataDir =
-    process.env.KEEWEB_PORTABLE_EXECUTABLE_DIR ||
-    app.getPath('userData').replace(/[\\/]temp[\\/]\d+\.\d+[\\/]?$/, '');
-const windowPositionFileName = path.join(userDataDir, 'window-position.json');
-const appSettingsFileName = path.join(userDataDir, 'app-settings.json');
-const tempUserDataPath = path.join(userDataDir, 'temp');
-const tempUserDataPathRand = Date.now().toString() + Math.random().toString();
+let usingPortableUserDataDir = false;
+let execPath;
 
-let htmlPath = process.argv
-    .filter(arg => arg.startsWith('--htmlpath='))
-    .map(arg => arg.replace('--htmlpath=', ''))[0];
-if (!htmlPath) {
-    htmlPath = 'file://' + path.join(__dirname, 'index.html');
-}
+setUserDataPaths();
+
+let openFile = process.argv.filter((arg) => /\.kdbx$/i.test(arg))[0];
+
+const htmlPath =
+    (isDev && process.env.KEEWEB_HTML_PATH) ||
+    url.format({ protocol: 'file', slashes: true, pathname: path.join(__dirname, 'index.html') });
 
 const showDevToolsOnStart =
-    process.argv.some(arg => arg.startsWith('--devtools')) ||
+    process.argv.some((arg) => arg.startsWith('--devtools')) ||
     process.env.KEEWEB_OPEN_DEVTOOLS === '1';
 
-const startMinimized = process.argv.some(arg => arg.startsWith('--minimized'));
+const loginItemSettings = process.platform === 'darwin' ? app.getLoginItemSettings() : {};
+
+const startMinimized =
+    loginItemSettings.wasOpenedAsHidden ||
+    process.argv.some((arg) => arg.startsWith('--minimized'));
 
 const themeBgColors = {
     db: '#342f2e',
@@ -56,12 +67,23 @@ const themeBgColors = {
 };
 const defaultBgColor = '#282C34';
 
-perfTimestamps && perfTimestamps.push({ name: 'defining args', ts: process.hrtime() });
+logProgress('defining args');
 
 setEnv();
-restorePreferences();
+setDevAppIcon();
 
-const appSettings = readAppSettings() || {};
+let configEncryptionKey;
+let appSettings;
+
+const settingsPromise = loadSettingsEncryptionKey().then((key) => {
+    configEncryptionKey = key;
+    logProgress('loading settings key');
+
+    return loadConfig('app-settings').then((settings) => {
+        appSettings = settings ? JSON.parse(settings) : {};
+        logProgress('reading app settings');
+    });
+});
 
 app.on('window-all-closed', () => {
     if (restartPending) {
@@ -74,15 +96,22 @@ app.on('window-all-closed', () => {
     }
 });
 app.on('ready', () => {
-    perfTimestamps && perfTimestamps.push({ name: 'app on ready', ts: process.hrtime() });
+    logProgress('app on ready');
     appReady = true;
-    setAppOptions();
-    setSystemAppearance();
-    createMainWindow();
-    setGlobalShortcuts(appSettings);
-    subscribePowerEvents();
-    deleteOldTempFiles();
-    hookRequestHeaders();
+
+    settingsPromise
+        .then(() => {
+            setSystemAppearance();
+            createMainWindow();
+            setGlobalShortcuts(appSettings);
+            subscribePowerEvents();
+            deleteOldTempFiles();
+            hookRequestHeaders();
+        })
+        .catch((e) => {
+            electron.dialog.showErrorBox('KeeWeb', 'Error loading app: ' + e);
+            process.exit(2);
+        });
 });
 app.on('open-file', (e, path) => {
     e.preventDefault();
@@ -94,6 +123,12 @@ app.on('activate', () => {
         if (appReady && !mainWindow) {
             createMainWindow();
         }
+    }
+});
+app.on('before-quit', (e) => {
+    if (app.hookBeforeQuitEvent) {
+        e.preventDefault();
+        emitRemoteEvent('launcher-before-quit');
     }
 });
 app.on('will-quit', () => {
@@ -116,14 +151,14 @@ app.on('web-contents-created', (event, contents) => {
         }
     });
 });
-app.restartApp = function() {
+app.restartApp = function () {
     restartPending = true;
     mainWindow.close();
     setTimeout(() => {
         restartPending = false;
     }, 1000);
 };
-app.minimizeApp = function(menuItemLabels) {
+app.minimizeApp = function (menuItemLabels) {
     let imagePath;
     mainWindow.hide();
     if (process.platform === 'darwin') {
@@ -145,30 +180,31 @@ app.minimizeApp = function(menuItemLabels) {
         appIcon.setToolTip('KeeWeb');
     }
 };
-app.minimizeThenHideIfInTray = function() {
+app.minimizeThenHideIfInTray = function () {
     // This function is called when auto-type has displayed a selection list and a selection was made.
     // To ensure focus returns to the previous window we must minimize first even if we're going to hide.
     mainWindow.minimize();
     if (appIcon) mainWindow.hide();
 };
-app.getMainWindow = function() {
+app.getMainWindow = function () {
     return mainWindow;
 };
+app.setHookBeforeQuitEvent = (hooked) => {
+    app.hookBeforeQuitEvent = !!hooked;
+};
 app.setGlobalShortcuts = setGlobalShortcuts;
+app.showAndFocusMainWindow = showAndFocusMainWindow;
+app.loadConfig = loadConfig;
+app.saveConfig = saveConfig;
+app.getAppMainRoot = getAppMainRoot;
+app.getAppContentRoot = getAppContentRoot;
+app.httpRequest = httpRequest;
 
-function setAppOptions() {
-    app.commandLine.appendSwitch('disable-background-timer-throttling');
-    perfTimestamps && perfTimestamps.push({ name: 'setting app options', ts: process.hrtime() });
-}
-
-function readAppSettings() {
-    try {
-        return JSON.parse(fs.readFileSync(appSettingsFileName, 'utf8'));
-    } catch (e) {
-        return null;
-    } finally {
-        perfTimestamps &&
-            perfTimestamps.push({ name: 'reading app settings', ts: process.hrtime() });
+function logProgress(name) {
+    perfTimestamps?.push({ name, ts: process.hrtime() });
+    if (startupLogging) {
+        // eslint-disable-next-line no-console
+        console.log('[startup]', name);
     }
 }
 
@@ -178,11 +214,16 @@ function setSystemAppearance() {
             electron.systemPreferences.appLevelAppearance = 'dark';
         }
     }
-    perfTimestamps &&
-        perfTimestamps.push({ name: 'setting system appearance', ts: process.hrtime() });
+    logProgress('setting system appearance');
+}
+
+function getDefaultTheme() {
+    return process.platform === 'darwin' ? 'macdark' : 'fb';
 }
 
 function createMainWindow() {
+    const theme = appSettings.theme || getDefaultTheme();
+    const bgColor = themeBgColors[theme] || defaultBgColor;
     const windowOptions = {
         show: false,
         width: 1000,
@@ -190,28 +231,28 @@ function createMainWindow() {
         minWidth: 700,
         minHeight: 400,
         titleBarStyle: appSettings.titlebarStyle,
-        backgroundColor: themeBgColors[appSettings.theme] || defaultBgColor,
+        backgroundColor: bgColor,
         webPreferences: {
             backgroundThrottling: false,
             nodeIntegration: true,
-            nodeIntegrationInWorker: true
+            nodeIntegrationInWorker: true,
+            enableRemoteModule: true,
+            spellcheck: false,
+            v8CacheOptions: 'none'
         }
     };
     if (process.platform !== 'win32') {
         windowOptions.icon = path.join(__dirname, 'icon.png');
     }
     mainWindow = new electron.BrowserWindow(windowOptions);
-    perfTimestamps && perfTimestamps.push({ name: 'creating main window', ts: process.hrtime() });
+    logProgress('creating main window');
 
     setMenu();
-    perfTimestamps && perfTimestamps.push({ name: 'setting menu', ts: process.hrtime() });
+    logProgress('setting menu');
 
     mainWindow.loadURL(htmlPath);
-    if (showDevToolsOnStart) {
-        mainWindow.openDevTools({ mode: 'bottom' });
-    }
     mainWindow.once('ready-to-show', () => {
-        perfTimestamps && perfTimestamps.push({ name: 'main window ready', ts: process.hrtime() });
+        logProgress('main window ready');
         if (startMinimized) {
             emitRemoteEvent('launcher-started-minimized');
         } else {
@@ -219,14 +260,19 @@ function createMainWindow() {
         }
         ready = true;
         notifyOpenFile();
-        perfTimestamps && perfTimestamps.push({ name: 'main window shown', ts: process.hrtime() });
+        logProgress('main window shown');
         reportStartProfile();
+
+        if (showDevToolsOnStart) {
+            mainWindow.webContents.openDevTools({ mode: 'bottom' });
+        }
     });
     mainWindow.webContents.on('context-menu', onContextMenu);
     mainWindow.on('resize', delaySaveMainWindowPosition);
     mainWindow.on('move', delaySaveMainWindowPosition);
     mainWindow.on('restore', coerceMainWindowPositionToConnectedDisplay);
-    mainWindow.on('close', updateMainWindowPositionIfPending);
+    mainWindow.on('close', mainWindowClosing);
+    mainWindow.on('closed', mainWindowClosed);
     mainWindow.on('focus', mainWindowFocus);
     mainWindow.on('blur', mainWindowBlur);
     mainWindow.on('closed', () => {
@@ -235,6 +281,12 @@ function createMainWindow() {
     });
     mainWindow.on('minimize', () => {
         emitRemoteEvent('launcher-minimize');
+    });
+    mainWindow.on('maximize', () => {
+        mainWindowMaximized = true;
+    });
+    mainWindow.on('unmaximize', () => {
+        mainWindowMaximized = false;
     });
     mainWindow.on('leave-full-screen', () => {
         emitRemoteEvent('leave-full-screen');
@@ -245,19 +297,16 @@ function createMainWindow() {
     mainWindow.on('session-end', () => {
         emitRemoteEvent('os-lock');
     });
-    perfTimestamps &&
-        perfTimestamps.push({ name: 'configuring main window', ts: process.hrtime() });
+    logProgress('configuring main window');
 
     restoreMainWindowPosition();
-    perfTimestamps &&
-        perfTimestamps.push({ name: 'restoring main window position', ts: process.hrtime() });
+    logProgress('restoring main window position');
 }
 
 function restoreMainWindow() {
-    // if (process.platform === 'darwin') {
-    //     app.dock.show();
-    //     mainWindow.show();
-    // }
+    if (process.platform === 'darwin' && !app.dock.isVisible()) {
+        app.dock.show();
+    }
     if (mainWindow.isMinimized()) {
         mainWindow.restore();
     }
@@ -265,6 +314,18 @@ function restoreMainWindow() {
     mainWindow.show();
     coerceMainWindowPositionToConnectedDisplay();
     setTimeout(destroyAppIcon, 0);
+}
+
+function showAndFocusMainWindow() {
+    if (mainWindowMaximized) {
+        mainWindow.maximize();
+    } else {
+        mainWindow.show();
+    }
+    mainWindow.focus();
+    if (process.platform === 'darwin' && !app.dock.isVisible()) {
+        app.dock.show();
+    }
 }
 
 function closeMainWindow() {
@@ -316,12 +377,17 @@ function saveMainWindowPosition() {
     }
     delete mainWindowPosition.changed;
     try {
-        fs.writeFileSync(windowPositionFileName, JSON.stringify(mainWindowPosition), 'utf8');
+        fs.writeFileSync(
+            path.join(app.getPath('userData'), windowPositionFileName),
+            JSON.stringify(mainWindowPosition),
+            'utf8'
+        );
     } catch (e) {}
 }
 
 function restoreMainWindowPosition() {
-    fs.readFile(windowPositionFileName, 'utf8', (e, data) => {
+    const fileName = path.join(app.getPath('userData'), windowPositionFileName);
+    fs.readFile(fileName, 'utf8', (e, data) => {
         if (data) {
             mainWindowPosition = JSON.parse(data);
             if (mainWindow && mainWindowPosition) {
@@ -331,6 +397,7 @@ function restoreMainWindowPosition() {
                 }
                 if (mainWindowPosition.maximized) {
                     mainWindow.maximize();
+                    mainWindowMaximized = true;
                 }
                 if (mainWindowPosition.fullScreen) {
                     mainWindow.setFullScreen(true);
@@ -346,6 +413,14 @@ function mainWindowBlur() {
 
 function mainWindowFocus() {
     emitRemoteEvent('main-window-focus');
+}
+
+function mainWindowClosing() {
+    updateMainWindowPositionIfPending();
+}
+
+function mainWindowClosed() {
+    app.removeAllListeners('remote-app-event');
 }
 
 function emitRemoteEvent(e, arg) {
@@ -425,8 +500,8 @@ function onContextMenu(e, props) {
 function notifyOpenFile() {
     if (ready && openFile && mainWindow) {
         const openKeyfile = process.argv
-            .filter(arg => arg.startsWith('--keyfile='))
-            .map(arg => arg.replace('--keyfile=', ''))[0];
+            .filter((arg) => arg.startsWith('--keyfile='))
+            .map((arg) => arg.replace('--keyfile=', ''))[0];
         const fileInfo = JSON.stringify({ data: openFile, key: openKeyfile });
         mainWindow.webContents.executeJavaScript(
             'if (window.launcherOpen) { window.launcherOpen(' +
@@ -467,8 +542,7 @@ function setGlobalShortcuts(appSettings) {
             } catch (e) {}
         }
     }
-    perfTimestamps &&
-        perfTimestamps.push({ name: 'setting global shortcuts', ts: process.hrtime() });
+    logProgress('setting global shortcuts');
 }
 
 function subscribePowerEvents() {
@@ -481,12 +555,56 @@ function subscribePowerEvents() {
     electron.powerMonitor.on('lock-screen', () => {
         emitRemoteEvent('os-lock');
     });
-    perfTimestamps &&
-        perfTimestamps.push({ name: 'subscribing to power events', ts: process.hrtime() });
+    logProgress('subscribing to power events');
+}
+
+function setUserDataPaths() {
+    execPath = process.execPath;
+
+    let isPortable = false;
+
+    switch (process.platform) {
+        case 'darwin':
+            isPortable = !execPath.includes('/Applications/');
+            if (isPortable) {
+                execPath = execPath.substring(0, execPath.indexOf('.app'));
+            }
+            break;
+        case 'win32':
+            isPortable = !execPath.includes('Program Files');
+            break;
+        case 'linux':
+            isPortable = !execPath.startsWith('/usr/') && !execPath.startsWith('/opt/');
+            break;
+    }
+
+    if (isDev && process.env.KEEWEB_IS_PORTABLE) {
+        isPortable = !!JSON.parse(process.env.KEEWEB_IS_PORTABLE);
+    }
+
+    logProgress('portable check');
+
+    if (isPortable) {
+        const portableConfigDir = path.dirname(execPath);
+        const portableConfigPath = path.join(portableConfigDir, portableConfigFileName);
+
+        if (fs.existsSync(portableConfigPath)) {
+            const portableConfig = JSON.parse(fs.readFileSync(portableConfigPath, 'utf8'));
+            const portableUserDataDir = path.resolve(portableConfigDir, portableConfig.userDataDir);
+
+            if (!fs.existsSync(portableUserDataDir)) {
+                fs.mkdirSync(portableUserDataDir, { recursive: true });
+            }
+
+            app.setPath('userData', portableUserDataDir);
+            usingPortableUserDataDir = true;
+        }
+    }
+
+    logProgress('userdata dir');
 }
 
 function setEnv() {
-    app.setPath('userData', path.join(tempUserDataPath, tempUserDataPathRand));
     if (
         process.platform === 'linux' &&
         ['Pantheon', 'Unity:Unity7'].indexOf(process.env.XDG_CURRENT_DESKTOP) !== -1
@@ -494,58 +612,30 @@ function setEnv() {
         // https://github.com/electron/electron/issues/9046
         process.env.XDG_CURRENT_DESKTOP = 'Unity';
     }
-    perfTimestamps && perfTimestamps.push({ name: 'setting env', ts: process.hrtime() });
+
+    app.commandLine.appendSwitch('disable-background-timer-throttling');
+
+    // disable all caching, since we're not using old profile data anyway
+    app.commandLine.appendSwitch('disable-http-cache');
+    app.commandLine.appendSwitch('disable-gpu-shader-disk-cache');
+
+    app.allowRendererProcessReuse = true;
+
+    logProgress('setting env');
 }
 
-function restorePreferences() {
-    const profileConfigPath = path.join(userDataDir, 'profile.json');
-
-    const newProfile = { dir: tempUserDataPathRand };
-    let oldProfile;
-    try {
-        oldProfile = JSON.parse(fs.readFileSync(profileConfigPath, 'utf8'));
-    } catch (e) {}
-
-    fs.writeFileSync(profileConfigPath, JSON.stringify(newProfile));
-
-    if (oldProfile && oldProfile.dir && /^[\d.]+$/.test(oldProfile.dir)) {
-        const oldProfilePath = path.join(tempUserDataPath, oldProfile.dir);
-        const newProfilePath = path.join(tempUserDataPath, newProfile.dir);
-        if (fs.existsSync(path.join(oldProfilePath, 'Cookies'))) {
-            if (!fs.existsSync(newProfilePath)) {
-                fs.mkdirSync(newProfilePath);
-            }
-            const cookiesFileSrc = path.join(oldProfilePath, 'Cookies');
-            const cookiesFileDest = path.join(newProfilePath, 'Cookies');
-            try {
-                fs.renameSync(cookiesFileSrc, cookiesFileDest);
-            } catch (e) {
-                try {
-                    fs.copyFileSync(cookiesFileSrc, cookiesFileDest);
-                } catch (e) {}
-            }
-        }
-    }
-
-    perfTimestamps && perfTimestamps.push({ name: 'restoring preferences', ts: process.hrtime() });
-}
-
+// TODO: delete after v1.15
 function deleteOldTempFiles() {
     if (app.oldTempFilesDeleted) {
         return;
     }
     setTimeout(() => {
-        for (const dir of fs.readdirSync(tempUserDataPath)) {
-            if (dir !== tempUserDataPathRand) {
-                try {
-                    deleteRecursive(path.join(tempUserDataPath, dir));
-                } catch (e) {}
-            }
+        const tempPath = path.join(app.getPath('userData'), 'temp');
+        if (fs.existsSync(tempPath)) {
+            deleteRecursive(tempPath);
         }
         app.oldTempFilesDeleted = true; // this is added to prevent file deletion on restart
     }, 1000);
-    perfTimestamps &&
-        perfTimestamps.push({ name: 'deleting old temp files', ts: process.hrtime() });
 }
 
 function deleteRecursive(dir) {
@@ -560,19 +650,30 @@ function deleteRecursive(dir) {
     fs.rmdirSync(dir);
 }
 
+function setDevAppIcon() {
+    if (isDev && htmlPath && process.platform === 'darwin') {
+        const icon = electron.nativeImage.createFromPath(
+            path.join(__dirname, '../graphics/512x512.png')
+        );
+        app.dock.setIcon(icon);
+    }
+}
+
 // When sending a PUT XMLHttpRequest Chromium includes the header "Origin: file://".
 // This confuses some WebDAV clients, notably OwnCloud.
 // The header is invalid, so removing it everywhere it occurs should do no harm.
 
 function hookRequestHeaders() {
     electron.session.defaultSession.webRequest.onBeforeSendHeaders((details, callback) => {
-        if (!details.url.startsWith('ws:')) {
+        if (
+            !details.url.startsWith('ws:') &&
+            !details.url.startsWith('https://plugins.keeweb.info/')
+        ) {
             delete details.requestHeaders.Origin;
         }
         callback({ requestHeaders: details.requestHeaders });
     });
-    perfTimestamps &&
-        perfTimestamps.push({ name: 'setting request handlers', ts: process.hrtime() });
+    logProgress('setting request handlers');
 }
 
 // If a display is disconnected while KeeWeb is minimized, Electron does not
@@ -625,7 +726,7 @@ function reportStartProfile() {
     const totalTime = Math.round(Date.now() - processCreationTime);
     let lastTs = 0;
     const timings = perfTimestamps
-        .map(milestone => {
+        .map((milestone) => {
             const ts = milestone.ts;
             const elapsed = lastTs
                 ? Math.round((ts[0] - lastTs[0]) * 1e3 + (ts[1] - lastTs[1]) / 1e6)
@@ -642,4 +743,205 @@ function reportStartProfile() {
 
     const startProfile = { totalTime, timings };
     emitRemoteEvent('start-profile', startProfile);
+}
+
+function getAppMainRoot() {
+    if (isDev) {
+        return __dirname;
+    } else {
+        return process.mainModule.path;
+    }
+}
+
+function getAppContentRoot() {
+    return __dirname;
+}
+
+function reqNative(mod) {
+    const fileName = `${mod}-${process.platform}-${process.arch}.node`;
+
+    const modulePath = `../node_modules/@keeweb/keeweb-native-modules/${fileName}`;
+    const fullPath = path.join(getAppMainRoot(), modulePath);
+
+    return require(fullPath);
+}
+
+function loadSettingsEncryptionKey() {
+    return Promise.resolve().then(() => {
+        if (usingPortableUserDataDir) {
+            return null;
+        }
+
+        const explicitlyDisabledFile = path.join(app.getPath('userData'), 'disable-keytar');
+        if (fs.existsSync(explicitlyDisabledFile)) {
+            // TODO: remove this fallback if everything goes well on v1.15
+            // This is a protective measure if everything goes terrible with native modules
+            // For example, the app can crash and it won't be possible to use it at all
+            return null;
+        }
+
+        const keytar = reqNative('keytar');
+
+        return keytar.getPassword('KeeWeb', 'settings-key').then((key) => {
+            if (key) {
+                return Buffer.from(key, 'hex');
+            }
+            key = require('crypto').randomBytes(48);
+            return keytar.setPassword('KeeWeb', 'settings-key', key.toString('hex')).then(() => {
+                return migrateOldConfigs(key).then(() => key);
+            });
+        });
+    });
+}
+
+function loadConfig(name) {
+    const ext = configEncryptionKey ? 'dat' : 'json';
+    const configFilePath = path.join(app.getPath('userData'), `${name}.${ext}`);
+
+    return new Promise((resolve, reject) => {
+        fs.readFile(configFilePath, (err, data) => {
+            if (err) {
+                if (err.code === 'ENOENT') {
+                    resolve(null);
+                } else {
+                    reject(`Error reading config ${name}: ${err}`);
+                }
+                return;
+            }
+
+            try {
+                if (configEncryptionKey) {
+                    const key = configEncryptionKey.slice(0, 32);
+                    const iv = configEncryptionKey.slice(32, 48);
+
+                    const crypto = require('crypto');
+                    const cipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+
+                    data = Buffer.concat([cipher.update(data), cipher.final()]);
+                }
+
+                resolve(data.toString('utf8'));
+            } catch (err) {
+                reject(`Error reading config data ${name}: ${err}`);
+            }
+        });
+    });
+}
+
+function saveConfig(name, data, key) {
+    if (!key) {
+        key = configEncryptionKey;
+    }
+
+    return new Promise((resolve, reject) => {
+        try {
+            data = Buffer.from(data);
+
+            if (key) {
+                const crypto = require('crypto');
+                const cipher = crypto.createCipheriv(
+                    'aes-256-cbc',
+                    key.slice(0, 32),
+                    key.slice(32, 48)
+                );
+
+                data = Buffer.concat([cipher.update(data), cipher.final()]);
+            }
+        } catch (err) {
+            return reject(`Error writing config data ${name}: ${err}`);
+        }
+
+        const ext = key ? 'dat' : 'json';
+        const configFilePath = path.join(app.getPath('userData'), `${name}.${ext}`);
+        fs.writeFile(configFilePath, data, (err) => {
+            if (err) {
+                reject(`Error writing config ${name}: ${err}`);
+            } else {
+                resolve();
+            }
+        });
+    });
+}
+
+// TODO: delete in 2021
+function migrateOldConfigs(key) {
+    const knownConfigs = [
+        'file-info',
+        'app-settings',
+        'runtime-data',
+        'update-info',
+        'plugin-gallery',
+        'plugins'
+    ];
+
+    const promises = [];
+
+    for (const configName of knownConfigs) {
+        promises.push(
+            loadConfig(configName).then((data) => {
+                if (data) {
+                    return saveConfig(configName, data, key).then(() => {
+                        fs.unlinkSync(path.join(app.getPath('userData'), `${configName}.json`));
+                    });
+                }
+            })
+        );
+    }
+
+    return Promise.all(promises);
+}
+
+function httpRequest(config, log, onLoad) {
+    // eslint-disable-next-line node/no-deprecated-api
+    const opts = url.parse(config.url);
+
+    opts.method = config.method || 'GET';
+    opts.headers = {
+        'User-Agent': mainWindow.webContents.userAgent,
+        ...config.headers
+    };
+    opts.timeout = 60000;
+
+    let data;
+    if (config.data) {
+        if (config.dataIsMultipart) {
+            data = Buffer.concat(config.data.map((chunk) => Buffer.from(chunk)));
+        } else {
+            data = Buffer.from(config.data);
+        }
+        // Electron's API doesn't like that, while node.js needs it
+        // opts.headers['Content-Length'] = data.byteLength;
+    }
+
+    const req = electron.net.request(opts);
+
+    req.on('response', (res) => {
+        const chunks = [];
+        const onClose = () => {
+            log('info', 'HTTP response', opts.method, config.url, res.statusCode, res.headers);
+            onLoad({
+                status: res.statusCode,
+                response: Buffer.concat(chunks).toString('hex'),
+                headers: res.headers
+            });
+        };
+        res.on('data', (chunk) => {
+            chunks.push(chunk);
+        });
+        res.on('end', () => {
+            onClose();
+        });
+    });
+    req.on('error', (e) => {
+        log('error', 'HTTP error', opts.method, config.url, e);
+        return config.error && config.error('network error', {});
+    });
+    req.on('timeout', () => {
+        req.abort();
+        return config.error && config.error('timeout', {});
+    });
+    if (data) {
+        req.write(data);
+    }
+    req.end();
 }

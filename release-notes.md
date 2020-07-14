@@ -1,5 +1,51 @@
 Release notes
 -------------
+##### v1.15.5 (2020-06-13)
+`-` fix #1539: broken code signing on Windows  
+
+##### v1.15.4 (2020-06-13)
+`-` fix #1536: added a missing dependency on linux  
+`-` fix #1532: crashes on some Windows builds (updated electron)  
+
+##### v1.15.3 (2020-06-11)
+`-` fix #1535: network errors in Dropbox and GDrive on Windows  
+
+##### v1.15.2 (2020-06-09)
+`-` fix #1530: recursive creation of the portable directory  
+`-` fix #1530: running from directories with hash symbols  
+`+` possibility to debug startup with `--start-logging`  
+`*` updated electron version  
+`-` fixed duplicated YubiKeys displayed in file settings  
+`-` fix #1409: auto-type wrong character issues on Linux  
+
+##### v1.15.1 (2020-06-07)
+`-` fix #1528: OTP generation for stored values  
+
+##### v1.15.0 (2020-06-06)
+`+` YubiKey integration in two modes: OATH and Challenge-Response  
+`+` configs are now encrypted with a key stored in keychain  
+`*` default format for new files is now KDBX4  
+`+` #1460: auto-type on double-clicking field labels  
+`+` #557: Argon2 speed improvements in desktop apps  
+`+` #1503: ARM64 Windows support  
+`+` #1480: option to create a portable installation  
+`+` #1400: auto-apply tag when creating new entry in tag view  
+`*` default theme on macOS is now macOS-Dark   
+`+` #1342: hint that the data will be stored in unencrypted form after exporting  
+`*` #1471: WebDAV url validation, only HTTPS is allowed  
+`+` #1350: clearing master password after auto lock period  
+`+` #830: minimize instead of close option on macOS  
+`+` #448: minimized login option support on macOS  
+`+` #917: option to install without a desktop icon on Windows  
+`-` fix #1463: copying the original url instead of adding https:  
+`-` fix #620: clearing middle-click clipboard in Linux  
+`-` fix #1440: fixed auto-type for maximized windows  
+`-` fix #1509: fixed auto-type for tiling mode in Linux  
+`-` fix #1409: fixed auto-typing Tab character on Debian  
+
+##### v1.14.3 (2020-05-15)
+`*` improved exporting files with markdown notes  
+
 ##### v1.14.2 (2020-05-04)
 `-` distinct redirect URIs for storage providers  
 

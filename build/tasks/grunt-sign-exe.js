@@ -4,11 +4,11 @@ const { spawnSync } = require('child_process');
 const AdmZip = require('adm-zip');
 const { runRemoteTask } = require('run-remote-task');
 
-module.exports = function(grunt) {
+module.exports = function (grunt) {
     grunt.registerMultiTask(
         'sign-exe',
         'Signs exe file with authenticode certificate',
-        async function() {
+        async function () {
             const done = this.async();
             const opt = this.options();
 
@@ -42,6 +42,11 @@ module.exports = function(grunt) {
             const taskResult = await runRemoteTask(opt.windows, zipContents);
             const signedFile = taskResult.file;
 
+            const zip = new AdmZip(signedFile);
+            const data = zip.readFile(fileNameWithoutFolder);
+
+            fs.writeFileSync(signedFile, data);
+
             const signtool =
                 'C:\\Program Files (x86)\\Windows Kits\\10\\App Certification Kit\\signtool.exe';
             const res = spawnSync(signtool, ['verify', '/pa', '/v', signedFile]);
@@ -60,8 +65,8 @@ module.exports = function(grunt) {
                 grunt.warn(`Verify error ${file}: expected hash was not found`);
             }
 
-            fs.unlinkSync(signedFile, file);
-            fs.writeFileSync(file, taskResult.data);
+            fs.unlinkSync(signedFile);
+            fs.writeFileSync(file, data);
             grunt.log.writeln(`Signed ${file}: ${name}`);
         } catch (e) {
             grunt.warn(`Sign error ${file}: ${e}`);

@@ -7,7 +7,6 @@ import { StorageOAuthListener } from 'storage/storage-oauth-listener';
 import { UrlFormat } from 'util/formatting/url-format';
 import { Launcher } from 'comp/launcher';
 import { omitEmpty } from 'util/fn';
-import { Timeouts } from 'const/timeouts';
 import { Features } from 'util/features';
 import { createOAuthSession } from 'storage/pkce';
 
@@ -69,14 +68,14 @@ class StorageBase {
                 'Authorization': 'Bearer ' + this._oauthToken.accessToken
             };
         }
-        this._httpRequest(config, response => {
+        this._httpRequest(config, (response) => {
             this.logger.info('HTTP response', response.status);
             const statuses = config.statuses || [200];
             if (statuses.indexOf(response.status) >= 0) {
                 return config.success && config.success(response.response, response);
             }
             if (response.status === 401 && this._oauthToken) {
-                this._oauthGetNewToken(err => {
+                this._oauthGetNewToken((err) => {
                     if (err) {
                         return config.error && config.error('unauthorized', response);
                     } else {
@@ -112,7 +111,7 @@ class StorageBase {
             onLoad({
                 status: xhr.status,
                 response: xhr.response,
-                getResponseHeader: name => xhr.getResponseHeader(name)
+                getResponseHeader: (name) => xhr.getResponseHeader(name)
             });
         });
         xhr.addEventListener('error', () => {
@@ -138,47 +137,11 @@ class StorageBase {
     }
 
     _httpRequestLauncher(config, onLoad) {
-        const net = Launcher.remReq('electron').net;
-
-        const opts = Launcher.req('url').parse(config.url);
-
-        opts.method = config.method || 'GET';
-        opts.headers = {
-            'User-Agent': navigator.userAgent,
-            ...config.headers
-        };
-        opts.timeout = Timeouts.DefaultHttpRequest;
-
-        let data;
-        if (config.data) {
-            if (config.dataIsMultipart) {
-                data = Buffer.concat(config.data.map(chunk => Buffer.from(chunk)));
-            } else {
-                data = Buffer.from(config.data);
-            }
-            // Electron's API doesn't like that, while node.js needs it
-            // opts.headers['Content-Length'] = data.byteLength;
-        }
-
-        const req = net.request(opts);
-
-        let closed = false;
-        req.on('close', () => {
-            closed = true;
-        });
-
-        req.on('response', res => {
-            const chunks = [];
-            const onClose = () => {
-                this.logger.debug(
-                    'HTTP response',
-                    opts.method,
-                    config.url,
-                    res.statusCode,
-                    res.headers
-                );
-
-                let response = Buffer.concat(chunks);
+        Launcher.remoteApp().httpRequest(
+            config,
+            (level, ...args) => this.logger[level](...args),
+            ({ status, response, headers }) => {
+                response = Buffer.from(response, 'hex');
                 if (config.responseType === 'json') {
                     try {
                         response = JSON.parse(response.toString('utf8'));
@@ -192,33 +155,12 @@ class StorageBase {
                     );
                 }
                 onLoad({
-                    status: res.statusCode,
+                    status,
                     response,
-                    getResponseHeader: name => res.headers[name.toLowerCase()]
+                    getResponseHeader: (name) => headers[name.toLowerCase()]
                 });
-            };
-            res.on('data', chunk => {
-                chunks.push(chunk);
-                if (closed && !res.readable) {
-                    // sometimes 'close' event arrives faster in Electron
-                    onClose();
-                }
-            });
-            // in Electron it's not res.on('end'), like in node.js, which is a bit weird
-            req.on('close', onClose);
-        });
-        req.on('error', e => {
-            this.logger.error('HTTP error', opts.method, config.url, e);
-            return config.error && config.error('network error', {});
-        });
-        req.on('timeout', () => {
-            req.abort();
-            return config.error && config.error('timeout', {});
-        });
-        if (data) {
-            req.write(data);
-        }
-        req.end();
+            }
+        );
     }
 
     _openPopup(url, title, width, height, extras) {
@@ -250,7 +192,7 @@ class StorageBase {
             location: 'yes'
         };
         settings = Object.keys(settings)
-            .map(key => key + '=' + settings[key])
+            .map((key) => key + '=' + settings[key])
             .join(',');
 
         return window.open(url, title, settings, extras);
@@ -310,8 +252,8 @@ class StorageBase {
                 Launcher.openLink(url);
                 callback('browser-auth-started');
             });
-            listener.on('error', err => callback(err));
-            listener.on('result', result => this._oauthCodeReceived(result, session));
+            listener.on('error', (err) => callback(err));
+            listener.on('result', (result) => this._oauthCodeReceived(result, session));
             return;
         }
 
@@ -329,7 +271,7 @@ class StorageBase {
             callback('OAuth: popup closed');
         };
 
-        const windowMessage = e => {
+        const windowMessage = (e) => {
             if (e.origin !== location.origin) {
                 return;
             }
@@ -462,17 +404,17 @@ class StorageBase {
                 ...pkceParams
             }),
             dataType: 'application/x-www-form-urlencoded',
-            success: response => {
+            success: (response) => {
                 this.logger.debug('OAuth code exchanged', response);
                 const token = this._oauthProcessReturn(response);
                 if (token && token.error) {
                     return callback && callback('OAuth code exchange error: ' + token.error);
                 }
-                callback && callback();
+                callback?.();
             },
-            error: err => {
+            error: (err) => {
                 this.logger.error('Error exchanging OAuth code', err);
-                callback && callback('OAuth code exchange error: ' + err);
+                callback?.('OAuth code exchange error: ' + err);
             }
         });
     }
@@ -493,7 +435,7 @@ class StorageBase {
                 'refresh_token': refreshToken
             }),
             dataType: 'application/x-www-form-urlencoded',
-            success: response => {
+            success: (response) => {
                 this.logger.debug('Refresh token exchanged');
                 this._oauthProcessReturn({
                     'refresh_token': refreshToken,
@@ -507,7 +449,7 @@ class StorageBase {
                     this._oauthToken = null;
                 }
                 this.logger.error('Error exchanging refresh token', err);
-                callback && callback('Error exchanging refresh token');
+                callback?.('Error exchanging refresh token');
             }
         });
     }
